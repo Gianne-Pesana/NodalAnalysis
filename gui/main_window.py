@@ -5,8 +5,10 @@ from typing import Optional
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QSize, Qt
 from PySide6.QtGui import QColor, QDrag, QIcon, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -21,6 +23,7 @@ from gui.properties_panel import PropertiesPanel
 from gui import theme
 from math_engine.circuit import InvalidCircuitError
 from math_engine.nodal_analysis import solve_circuit
+from utils.circuit_io import load_circuit, save_circuit
 
 
 def _symbol_icon(kind: str) -> QIcon:
@@ -103,6 +106,8 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
+        self.btn_open = QPushButton("Open")
+        self.btn_save = QPushButton("Save")
         self.btn_rotate = QPushButton("Rotate (R)")
         self.btn_delete = QPushButton("Delete (Del)")
         self.btn_clear = QPushButton("Clear All")
@@ -114,6 +119,9 @@ class MainWindow(QMainWindow):
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
+        toolbar.addWidget(self.btn_open)
+        toolbar.addWidget(self.btn_save)
+        toolbar.addSeparator()
         toolbar.addWidget(self.btn_rotate)
         toolbar.addWidget(self.btn_delete)
         toolbar.addWidget(self.btn_clear)
@@ -172,6 +180,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
 
     def _connect_signals(self) -> None:
+        self.btn_open.clicked.connect(self.open_circuit_file)
+        self.btn_save.clicked.connect(self.save_circuit_file)
         self.btn_rotate.clicked.connect(self.canvas.rotate_selected)
         self.btn_delete.clicked.connect(self.canvas.delete_selected)
         self.btn_clear.clicked.connect(self.canvas.clear_all)
@@ -235,3 +245,38 @@ class MainWindow(QMainWindow):
         self.canvas.set_solution(solution, extraction)
         self.properties_panel.show_solution(solution, extraction)
         self._on_selection_changed(self.canvas.selected_kind, self.canvas.selected_id)
+
+    def save_circuit_file(self) -> None:
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Circuit",
+            "circuit.circuit.json",
+            "Circuit Files (*.circuit.json *.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+        try:
+            save_circuit(
+                file_path,
+                self.canvas.components.values(),
+                self.canvas.junctions.values(),
+                self.canvas.wires.values(),
+            )
+        except OSError as exc:
+            QMessageBox.warning(self, "Save Failed", f"Could not save circuit:\n{exc}")
+
+    def open_circuit_file(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Circuit",
+            "",
+            "Circuit Files (*.circuit.json *.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+        try:
+            components, junctions, wires = load_circuit(file_path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Open Failed", f"Could not open circuit:\n{exc}")
+            return
+        self.canvas.load_circuit_data(components, junctions, wires)

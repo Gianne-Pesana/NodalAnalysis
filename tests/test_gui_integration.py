@@ -1,7 +1,9 @@
 """Integration tests for GUI-to-math conversion, multiple grounds, and solution invalidation."""
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -19,6 +21,7 @@ from gui.components import (
 from gui.main_window import MainWindow
 from math_engine.circuit import InvalidCircuitError
 from math_engine.nodal_analysis import solve_circuit
+from utils.circuit_io import load_circuit, save_circuit
 
 
 class TestGuiIntegration(unittest.TestCase):
@@ -317,6 +320,53 @@ class TestGuiIntegration(unittest.TestCase):
         # 6. Deleting selected junction J1 removes J1 and its attached wires.
         canvas.delete_selected()
         self.assertNotIn("J1", canvas.junctions)
+        window.close()
+
+    def test_save_and_load_circuit_roundtrip(self) -> None:
+        """Saving and loading a circuit preserves geometry, values, IDs, and solved voltages."""
+        window = MainWindow()
+        i1 = window.canvas.add_component("current_source", 0, 0)
+        i1.value = 2.0
+        r1 = window.canvas.add_component("resistor", 140, 0)
+        r1.value = 4.0
+        r1.rotation = 90
+        gnd = window.canvas.add_component("ground", 0, 100)
+
+        j1_ep = window.canvas._create_junction(80, 0)
+        window.canvas._create_wire(("terminal", i1.component_id, 1), j1_ep)
+        window.canvas._create_wire(j1_ep, ("terminal", r1.component_id, 0))
+        window.canvas._create_wire(("terminal", i1.component_id, 0), ("terminal", gnd.component_id, 0))
+        window.canvas._create_wire(("terminal", r1.component_id, 1), ("terminal", gnd.component_id, 0))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            file_path = Path(tmp_dir) / "demo.circuit.json"
+            save_circuit(
+                file_path,
+                window.canvas.components.values(),
+                window.canvas.junctions.values(),
+                window.canvas.wires.values(),
+            )
+
+            loaded_window = MainWindow()
+            comps, juncs, wires = load_circuit(file_path)
+            loaded_window.canvas.load_circuit_data(comps, juncs, wires)
+
+            self.assertEqual(set(loaded_window.canvas.components.keys()), {"I1", "R1", "GND1"})
+            self.assertEqual(loaded_window.canvas.components["R1"].rotation, 90)
+            self.assertEqual(set(loaded_window.canvas.junctions.keys()), {"J1"})
+            self.assertEqual(len(loaded_window.canvas.wires), 4)
+
+            # Counters should be synced so newly added components don't collide.
+            r2 = loaded_window.canvas.add_component("resistor", 200, 0)
+            self.assertEqual(r2.component_id, "R2")
+            loaded_window.canvas.delete_selected()
+
+            loaded_window.solve_current_circuit()
+            self.assertIsNotNone(loaded_window.canvas.solution)
+            self.assertAlmostEqual(loaded_window.canvas.solution.node_voltages["N1"], 8.0, places=9)
+            self.assertTrue(loaded_window.canvas._anim_timer.isActive())
+            loaded_window.close()
+
         window.close()
 
 

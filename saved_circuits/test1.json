@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "components": [
+    {
+      "component_id": "I1",
+      "kind": "current_source",
+      "x": -40.0,
+      "y": 120.0,
+      "rotation": 270,
+      "value": 0.8
+    },
+    {
+      "component_id": "R1",
+      "kind": "resistor",
+      "x": 100.0,
+      "y": 120.0,
+      "rotation": 90,
+      "value": 180.0
+    },
+    {
+      "component_id": "R2",
+      "kind": "resistor",
+      "x": 200.0,
+      "y": 120.0,
+      "rotation": 90,
+      "value": 30.0
+    },
+    {
+      "component_id": "GND2",
+      "kind": "ground",
+      "x": -40.0,
+      "y": 240.0,
+      "rotation": 0,
+      "value": 0.0
+    }
+  ],
+  "junctions": [],
+  "wires": [
+    {
+      "wire_id": "W1",
+      "start": [
+        "terminal",
+        "I1",
+        1
+      ],
+      "end": [
+        "terminal",
+        "R1",
+        0
+      ]
+    },
+    {
+      "wire_id": "W2",
+      "start": [
+        "terminal",
+        "R1",
+        0
+      ],
+      "end": [
+        "terminal",
+        "R2",
+        0
+      ]
+    },
+    {
+      "wire_id": "W3",
+      "start": [
+        "terminal",
+        "R2",
+        1
+      ],
+      "end": [
+        "terminal",
+        "R1",
+        1
+      ]
+    },
+    {
+      "wire_id": "W6",
+      "start": [
+        "terminal",
+        "R1",
+        1
+      ],
+      "end": [
+        "terminal",
+        "I1",
+        0
+      ]
+    },
+    {
+      "wire_id": "W8",
+      "start": [
+        "terminal",
+        "I1",
+        0
+      ],
+      "end": [
+        "terminal",
+        "GND2",
+        0
+      ]
+    }
+  ]
+}

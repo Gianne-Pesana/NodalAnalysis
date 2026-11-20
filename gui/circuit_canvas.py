@@ -164,6 +164,42 @@ class CircuitCanvas(QWidget):
         self.circuit_modified.emit()
         self.update()
 
+    def load_circuit_data(
+        self,
+        components: list[ComponentItem],
+        junctions: list[WireJunction],
+        wires: list[WireSegment],
+    ) -> None:
+        """Replace the canvas contents with loaded components, junctions, and wires."""
+        self.components = {c.component_id: c for c in components}
+        self.junctions = {j.junction_id: j for j in junctions}
+        self.wires = {w.wire_id: w for w in wires}
+
+        self._counters = {k: 0 for k in self._counters}
+        prefix_to_key = {
+            "R": "resistor",
+            "I": "current_source",
+            "GND": "ground",
+            "W": "wire",
+            "J": "junction",
+        }
+        for item_id in [*self.components, *self.junctions, *self.wires]:
+            for prefix, counter_key in prefix_to_key.items():
+                if item_id.startswith(prefix) and item_id[len(prefix) :].isdigit():
+                    num = int(item_id[len(prefix) :])
+                    self._counters[counter_key] = max(self._counters[counter_key], num)
+                    break
+
+        self.selected_kind = None
+        self.selected_id = None
+        self._wire_start_endpoint = None
+        self._pending_junction_press = None
+        self._dragging_item = None
+        self.clear_solution()
+        self.selection_changed.emit(None, None)
+        self.circuit_modified.emit()
+        self.update()
+
     def screen_to_world(self, pos: QPointF) -> QPointF:
         return QPointF(
             (pos.x() - self.pan_offset.x()) / self.zoom,
