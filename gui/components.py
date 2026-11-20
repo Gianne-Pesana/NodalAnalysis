@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from math_engine.circuit import Circuit, CurrentSource, InvalidCircuitError, Resistor
+from math_engine.nodal_analysis import SolutionResult
 
 EndpointKey = tuple[str, str, int]  # (kind: "terminal"|"junction", owner_id, terminal_index)
 
@@ -218,3 +219,120 @@ def extract_circuit_from_gui(
         wire_to_node=wire_to_node,
         wire_to_components=wire_to_components,
     )
+
+
+def _solve_linear_system(matrix: list[list[float]], rhs: list[float]) -> list[float]:
+    """Solve a small dense linear system Ax = b via Gaussian elimination with partial pivoting."""
+    n = len(rhs)
+    if n == 0:
+        return []
+    aug = [row[:] + [rhs[idx]] for idx, row in enumerate(matrix)]
+
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(aug[r][col]))
+        if abs(aug[pivot][col]) < 1e-15:
+            continue
+        aug[col], aug[pivot] = aug[pivot], aug[col]
+        pivot_val = aug[col][col]
+        for row in range(col + 1, n):
+            factor = aug[row][col] / pivot_val
+            if factor == 0.0:
+                continue
+            for c in range(col, n + 1):
+                aug[row][c] -= factor * aug[col][c]
+
+    x = [0.0] * n
+    for row in range(n - 1, -1, -1):
+        diag = aug[row][row]
+        if abs(diag) < 1e-15:
+            continue
+        total = aug[row][n] - sum(aug[row][c] * x[c] for c in range(row + 1, n))
+        x[row] = total / diag
+    return x
+
+
+def compute_wire_currents(
+    wires: list[WireSegment],
+    extraction: ExtractionResult,
+    solution: SolutionResult,
+) -> dict[str, float]:
+    """Compute signed conventional current for each wire (positive: start -> end).
+
+    For each electrical node, solves KCL on the node's wire graph using the
+    graph Laplacian L * p = b, where b is the net current injected into the wire
+    graph at each component terminal.
+    """
+    injected: dict[EndpointKey, float] = {}
+
+    # Positive resistor current flows from node_a (T0) -> resistor -> node_b (T1).
+    for res in solution.resistor_results:
+        t0: EndpointKey = ("terminal", res.component_id, 0)
+        t1: EndpointKey = ("terminal", res.component_id, 1)
+        injected[t0] = injected.get(t0, 0.0) - res.current
+        injected[t1] = injected.get(t1, 0.0) + res.current
+
+    # Positive source current flows from node_from (T0) -> source -> node_to (T1).
+    for src in extraction.circuit.current_sources:
+        t0 = ("terminal", src.component_id, 0)
+        t1 = ("terminal", src.component_id, 1)
+        injected[t0] = injected.get(t0, 0.0) - src.current
+        injected[t1] = injected.get(t1, 0.0) + src.current
+
+    # Group wires by electrical node.
+    node_wires: dict[str, list[WireSegment]] = {}
+    for wire in wires:
+        node_name = extraction.wire_to_node.get(wire.wire_id)
+        if node_name is not None:
+            node_wires.setdefault(node_name, []).append(wire)
+
+    wire_currents: dict[str, float] = {wire.wire_id: 0.0 for wire in wires}
+
+    for segs in node_wires.values():
+        adj: dict[EndpointKey, list[tuple[EndpointKey, str]]] = {}
+        for seg in segs:
+            adj.setdefault(seg.start, []).append((seg.end, seg.wire_id))
+            adj.setdefault(seg.end, []).append((seg.start, seg.wire_id))
+
+        visited: set[EndpointKey] = set()
+        for root in adj:
+            if root in visited:
+                continue
+            comp_verts: list[EndpointKey] = []
+            queue: deque[EndpointKey] = deque([root])
+            visited.add(root)
+            while queue:
+                curr = queue.popleft()
+                comp_verts.append(curr)
+                for nbr, _ in adj[curr]:
+                    if nbr not in visited:
+                        visited.add(nbr)
+                        queue.append(nbr)
+
+            if len(comp_verts) <= 1:
+                continue
+
+            vert_idx = {ep: i for i, ep in enumerate(comp_verts)}
+            k = len(comp_verts)
+            laplacian = [[0.0] * k for _ in range(k)]
+            comp_segs: list[WireSegment] = []
+            for seg in segs:
+                if seg.start in vert_idx and seg.end in vert_idx:
+                    u, v = vert_idx[seg.start], vert_idx[seg.end]
+                    laplacian[u][u] += 1.0
+                    laplacian[v][v] += 1.0
+                    laplacian[u][v] -= 1.0
+                    laplacian[v][u] -= 1.0
+                    comp_segs.append(seg)
+
+            # Fix gauge p[0] = 0.0 and solve the (k-1) x (k-1) reduced system.
+            reduced_l = [row[1:] for row in laplacian[1:]]
+            reduced_b = [injected.get(ep, 0.0) for ep in comp_verts[1:]]
+            p_rest = _solve_linear_system(reduced_l, reduced_b)
+            potentials = [0.0] + p_rest
+
+            for seg in comp_segs:
+                u, v = vert_idx[seg.start], vert_idx[seg.end]
+                current = potentials[u] - potentials[v]
+                wire_currents[seg.wire_id] = 0.0 if abs(current) < 1e-12 else current
+
+    return wire_currents

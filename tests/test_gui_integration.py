@@ -5,12 +5,15 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication
 
 from gui.components import (
     ComponentItem,
     WireJunction,
     WireSegment,
+    compute_wire_currents,
     extract_circuit_from_gui,
 )
 from gui.main_window import MainWindow
@@ -146,6 +149,174 @@ class TestGuiIntegration(unittest.TestCase):
         window.canvas.flip_selected_current_source()
         window.solve_current_circuit()
         self.assertAlmostEqual(window.canvas.solution.node_voltages["N1"], 8.0, places=9)
+        window.close()
+
+    def test_wire_currents_and_animation_on_flip_and_rotation(self) -> None:
+        """Wire currents match conventional current, split at junctions, and reverse on flip."""
+        # 1. Branched junction circuit: I1 = 2 A -> J1 -> (R1 = 4 ohm: 1.2 A, R2 = 6 ohm: 0.8 A)
+        components = [
+            ComponentItem("I1", "current_source", 0, 0, rotation=90, value=2.0),
+            ComponentItem("R1", "resistor", 100, -40, rotation=0, value=4.0),
+            ComponentItem("R2", "resistor", 100, 40, rotation=180, value=6.0),
+            ComponentItem("GND1", "ground", 0, 120),
+        ]
+        junctions = [
+            WireJunction("J1", 40, 0),
+            WireJunction("J2", 160, 120),
+        ]
+        wires = [
+            WireSegment("W1", ("terminal", "I1", 1), ("junction", "J1", 0)),
+            WireSegment("W2", ("junction", "J1", 0), ("terminal", "R1", 0)),
+            WireSegment("W3", ("junction", "J1", 0), ("terminal", "R2", 0)),
+            WireSegment("W4", ("terminal", "R1", 1), ("junction", "J2", 0)),
+            WireSegment("W5", ("terminal", "R2", 1), ("junction", "J2", 0)),
+            WireSegment("W6", ("junction", "J2", 0), ("terminal", "GND1", 0)),
+            WireSegment("W7", ("terminal", "I1", 0), ("terminal", "GND1", 0)),
+        ]
+        extraction = extract_circuit_from_gui(components, junctions, wires)
+        solution = solve_circuit(extraction.circuit)
+        wire_currents = compute_wire_currents(wires, extraction, solution)
+
+        self.assertAlmostEqual(wire_currents["W1"], 2.0, places=9)
+        self.assertAlmostEqual(wire_currents["W2"], 1.2, places=9)
+        self.assertAlmostEqual(wire_currents["W3"], 0.8, places=9)
+        self.assertAlmostEqual(wire_currents["W4"], 1.2, places=9)
+        self.assertAlmostEqual(wire_currents["W5"], 0.8, places=9)
+        self.assertAlmostEqual(wire_currents["W6"], 2.0, places=9)
+        # W7 goes from I1.T0 to GND1.T0, while current enters I1.T0 from GND1.T0 -> -2.0 A.
+        self.assertAlmostEqual(wire_currents["W7"], -2.0, places=9)
+
+        # 2. MainWindow animation lifecycle + flip reversal
+        window = MainWindow()
+        i1 = window.canvas.add_component("current_source", 0, 0)
+        i1.value = 2.0
+        r1 = window.canvas.add_component("resistor", 140, 0)
+        r1.value = 4.0
+        gnd = window.canvas.add_component("ground", 0, 100)
+
+        # Rotate I1 by 90 degrees before solving; animation should still track terminals.
+        window.canvas._select("component", i1.component_id)
+        window.canvas.rotate_selected()
+        self.assertEqual(i1.rotation, 90)
+
+        window.canvas._create_wire(("terminal", i1.component_id, 1), ("terminal", r1.component_id, 0))
+        window.canvas._create_wire(("terminal", i1.component_id, 0), ("terminal", gnd.component_id, 0))
+        window.canvas._create_wire(("terminal", r1.component_id, 1), ("terminal", gnd.component_id, 0))
+
+        self.assertFalse(window.canvas._anim_timer.isActive())
+        window.solve_current_circuit()
+        self.assertTrue(window.canvas._anim_timer.isActive())
+        self.assertAlmostEqual(window.canvas._wire_currents["W1"], 2.0, places=9)
+        self.assertAlmostEqual(window.canvas._wire_currents["W2"], -2.0, places=9)
+        self.assertAlmostEqual(window.canvas._wire_currents["W3"], 2.0, places=9)
+
+        # Flipping stops animation until re-solved, then reverses all wire currents.
+        window.canvas._select("component", i1.component_id)
+        window.canvas.flip_selected_current_source()
+        self.assertFalse(window.canvas._anim_timer.isActive())
+        self.assertEqual(window.canvas._wire_currents, {})
+
+        window.solve_current_circuit()
+        self.assertTrue(window.canvas._anim_timer.isActive())
+        self.assertAlmostEqual(window.canvas._wire_currents["W1"], -2.0, places=9)
+        self.assertAlmostEqual(window.canvas._wire_currents["W2"], 2.0, places=9)
+        self.assertAlmostEqual(window.canvas._wire_currents["W3"], -2.0, places=9)
+
+        # Zero-current source -> solved and valid, but animation timer stays off.
+        i1.value = 0.0
+        window.solve_current_circuit()
+        self.assertFalse(window.canvas._anim_timer.isActive())
+        window.close()
+
+    def test_blank_canvas_junction_routing_and_branching(self) -> None:
+        """Clicking blank canvas while wiring places a point/junction that routes and branches cleanly."""
+        window = MainWindow()
+        self.assertFalse(hasattr(window, "btn_wire_mode"))
+        self.assertFalse(hasattr(window, "btn_select_mode"))
+
+        canvas = window.canvas
+        i1 = canvas.add_component("current_source", 0, 0)
+        i1.value = 2.0
+        r1 = canvas.add_component("resistor", 160, -40)
+        r1.value = 4.0
+        r2 = canvas.add_component("resistor", 160, 40)
+        r2.value = 6.0
+        gnd = canvas.add_component("ground", 0, 120)
+
+        def to_screen(wx: float, wy: float) -> QPointF:
+            return QPointF(wx * canvas.zoom + canvas.pan_offset.x(), wy * canvas.zoom + canvas.pan_offset.y())
+
+        def click_world(wx: float, wy: float, button: Qt.MouseButton = Qt.MouseButton.LeftButton) -> None:
+            pos = to_screen(wx, wy)
+            press = QMouseEvent(QEvent.Type.MouseButtonPress, pos, pos, button, button, Qt.KeyboardModifier.NoModifier)
+            release = QMouseEvent(QEvent.Type.MouseButtonRelease, pos, pos, button, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier)
+            canvas.mousePressEvent(press)
+            canvas.mouseReleaseEvent(release)
+
+        # 1. Start wire at I1.T1 (45, 0), click blank canvas at (80, 0) -> creates J1 and keeps wiring active.
+        t1_x, t1_y = i1.terminal_positions()[1]
+        click_world(t1_x, t1_y)
+        self.assertEqual(canvas._wire_start_endpoint, ("terminal", i1.component_id, 1))
+
+        click_world(80, 0)
+        self.assertIn("J1", canvas.junctions)
+        self.assertEqual(canvas._wire_start_endpoint, ("junction", "J1", 0))
+
+        # 2. Click blank canvas at (80, -40) -> creates J2, then connect to R1.T0 -> finishes wire.
+        click_world(80, -40)
+        self.assertIn("J2", canvas.junctions)
+        r1_t0_x, r1_t0_y = r1.terminal_positions()[0]
+        click_world(r1_t0_x, r1_t0_y)
+        self.assertIsNone(canvas._wire_start_endpoint)
+
+        # 3. Click J1 (without dragging) to branch to R2.T0.
+        click_world(80, 0)
+        self.assertEqual(canvas._wire_start_endpoint, ("junction", "J1", 0))
+        r2_t0_x, r2_t0_y = r2.terminal_positions()[0]
+        click_world(r2_t0_x, r2_t0_y)
+        self.assertIsNone(canvas._wire_start_endpoint)
+
+        # 4. Wire return path to ground via another blank-canvas junction J3 at (220, 120).
+        r1_t1_x, r1_t1_y = r1.terminal_positions()[1]
+        click_world(r1_t1_x, r1_t1_y)
+        click_world(220, 120)
+        gnd_x, gnd_y = gnd.terminal_positions()[0]
+        click_world(gnd_x, gnd_y)
+
+        r2_t1_x, r2_t1_y = r2.terminal_positions()[1]
+        click_world(r2_t1_x, r2_t1_y)
+        click_world(220, 120)  # connects to existing J3
+
+        i1_t0_x, i1_t0_y = i1.terminal_positions()[0]
+        click_world(i1_t0_x, i1_t0_y)
+        click_world(gnd_x, gnd_y)
+
+        # Solve and verify exact parallel-resistor voltage (4.8 V) and branch currents.
+        window.solve_current_circuit()
+        self.assertIsNotNone(canvas.solution)
+        self.assertTrue(canvas.solution.verification.passed)
+        self.assertAlmostEqual(canvas.solution.node_voltages["N1"], 4.8, places=9)
+        self.assertTrue(canvas._anim_timer.isActive())
+
+        # 5. Drag J1 from (80, 0) to (100, 0) -> snaps, invalidates solution, stops animation.
+        p_start = to_screen(80, 0)
+        p_end = to_screen(100, 0)
+        canvas.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, p_start, p_start, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+        canvas.mouseMoveEvent(QMouseEvent(QEvent.Type.MouseMove, p_end, p_end, Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+        canvas.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, p_end, p_end, Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+
+        self.assertEqual((canvas.junctions["J1"].x, canvas.junctions["J1"].y), (100.0, 0.0))
+        self.assertEqual((canvas.selected_kind, canvas.selected_id), ("junction", "J1"))
+        self.assertIsNone(canvas.solution)
+        self.assertFalse(canvas._anim_timer.isActive())
+
+        # Re-solving after moving J1 still gives 4.8 V.
+        window.solve_current_circuit()
+        self.assertAlmostEqual(canvas.solution.node_voltages["N1"], 4.8, places=9)
+
+        # 6. Deleting selected junction J1 removes J1 and its attached wires.
+        canvas.delete_selected()
+        self.assertNotIn("J1", canvas.junctions)
         window.close()
 
 

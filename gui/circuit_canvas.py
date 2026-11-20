@@ -3,7 +3,7 @@
 import math
 from typing import Optional
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -26,12 +26,16 @@ from gui.components import (
     ExtractionResult,
     WireJunction,
     WireSegment,
+    compute_wire_currents,
     resolve_endpoint_position,
 )
 from math_engine.nodal_analysis import SolutionResult
 
 GRID_SIZE = 20.0
 MIME_TYPE = "application/x-circuit-component"
+FLOW_DOT_SPACING = 22.0
+FLOW_DOT_RADIUS = 2.6
+FLOW_FPS_MS = 30
 
 
 def _snap(value: float) -> float:
@@ -70,7 +74,6 @@ class CircuitCanvas(QWidget):
         self.wires: dict[str, WireSegment] = {}
 
         self._counters = {"resistor": 0, "current_source": 0, "ground": 0, "wire": 0, "junction": 0}
-        self.mode: str = "select"  # "select" or "wire"
 
         self.selected_kind: Optional[str] = None  # "component" | "wire" | "junction"
         self.selected_id: Optional[str] = None
@@ -82,6 +85,7 @@ class CircuitCanvas(QWidget):
 
         # Dragging / panning state
         self._dragging_item: Optional[tuple[str, str]] = None  # ("component"|"junction", id)
+        self._pending_junction_press: Optional[tuple[str, QPointF]] = None
         self._drag_offset = QPointF(0.0, 0.0)
         self._panning = False
         self._pan_last_screen = QPointF(0.0, 0.0)
@@ -94,23 +98,58 @@ class CircuitCanvas(QWidget):
         self.solution: Optional[SolutionResult] = None
         self.extraction: Optional[ExtractionResult] = None
 
-    def set_mode(self, mode: str) -> None:
-        self.mode = mode
-        self._wire_start_endpoint = None
-        self.update()
+        # Wire current flow animation state
+        self._wire_currents: dict[str, float] = {}
+        self._wire_phases: dict[str, float] = {}
+        self._elapsed_timer = QElapsedTimer()
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(FLOW_FPS_MS)
+        self._anim_timer.timeout.connect(self._advance_flow_animation)
 
     def set_solution(
         self, solution: Optional[SolutionResult], extraction: Optional[ExtractionResult]
     ) -> None:
         self.solution = solution
         self.extraction = extraction
+        if solution is not None and extraction is not None and solution.verification.passed:
+            self._wire_currents = compute_wire_currents(
+                list(self.wires.values()), extraction, solution
+            )
+            self._wire_phases = {wid: 0.0 for wid in self._wire_currents}
+            self._elapsed_timer.start()
+            if any(abs(c) > 1e-9 for c in self._wire_currents.values()):
+                self._anim_timer.start()
+            else:
+                self._anim_timer.stop()
+        else:
+            self._stop_flow_animation()
         self.update()
 
     def clear_solution(self) -> None:
+        self._stop_flow_animation()
         if self.solution is not None or self.extraction is not None:
             self.solution = None
             self.extraction = None
             self.update()
+
+    def _stop_flow_animation(self) -> None:
+        self._anim_timer.stop()
+        self._wire_currents.clear()
+        self._wire_phases.clear()
+
+    def _advance_flow_animation(self) -> None:
+        if not self._wire_currents:
+            self._anim_timer.stop()
+            return
+        dt = min(self._elapsed_timer.restart() / 1000.0, 0.1)
+        for wid, current in self._wire_currents.items():
+            mag = abs(current)
+            if mag <= 1e-9:
+                continue
+            speed = 24.0 + 42.0 * min(math.sqrt(mag), 2.5)
+            phase = (self._wire_phases.get(wid, 0.0) + speed * dt) % FLOW_DOT_SPACING
+            self._wire_phases[wid] = phase
+        self.update()
 
     def clear_all(self) -> None:
         self.components.clear()
@@ -266,13 +305,18 @@ class CircuitCanvas(QWidget):
         self.wires[wid] = WireSegment(wire_id=wid, start=start, end=end)
         self.circuit_modified.emit()
 
-    def _split_wire_with_junction(self, wire_id: str, wx: float, wy: float) -> EndpointKey:
-        """Split an existing wire segment at (wx, wy) by inserting an explicit junction."""
-        old_wire = self.wires.pop(wire_id)
+    def _create_junction(self, wx: float, wy: float) -> EndpointKey:
+        """Create a grid-snapped wire junction/waypoint at (wx, wy) and return its endpoint key."""
         self._counters["junction"] += 1
         jid = f"J{self._counters['junction']}"
         self.junctions[jid] = WireJunction(junction_id=jid, x=_snap(wx), y=_snap(wy))
-        j_ep: EndpointKey = ("junction", jid, 0)
+        self.circuit_modified.emit()
+        return ("junction", jid, 0)
+
+    def _split_wire_with_junction(self, wire_id: str, wx: float, wy: float) -> EndpointKey:
+        """Split an existing wire segment at (wx, wy) by inserting an explicit junction."""
+        old_wire = self.wires.pop(wire_id)
+        j_ep = self._create_junction(wx, wy)
         self._create_wire(old_wire.start, j_ep)
         self._create_wire(j_ep, old_wire.end)
         return j_ep
@@ -318,14 +362,20 @@ class CircuitCanvas(QWidget):
         ep = self._find_endpoint_at(wx, wy)
         if ep is not None:
             if self._wire_start_endpoint is None:
-                self._wire_start_endpoint = ep
+                if ep[0] == "junction":
+                    # Defer starting a wire so dragging a junction moves it cleanly.
+                    self._pending_junction_press = (ep[1], event.position())
+                else:
+                    self._wire_start_endpoint = ep
             else:
                 self._create_wire(self._wire_start_endpoint, ep)
                 self._wire_start_endpoint = None
             self.update()
             return
 
-        # 2. If currently drawing a wire and user clicks an existing wire, create a junction.
+        # 2. If currently drawing a wire:
+        #    - clicking an existing wire splits it with a junction and finishes the wire;
+        #    - clicking blank canvas creates a new point/junction and continues routing from it.
         if self._wire_start_endpoint is not None:
             wid = self._find_wire_at(wx, wy)
             if wid is not None:
@@ -334,21 +384,13 @@ class CircuitCanvas(QWidget):
                 self._wire_start_endpoint = None
                 self.update()
                 return
-            # Clicking empty space cancels active wire drawing.
-            self._wire_start_endpoint = None
+            j_ep = self._create_junction(wx, wy)
+            self._create_wire(self._wire_start_endpoint, j_ep)
+            self._wire_start_endpoint = j_ep
             self.update()
             return
 
-        # 3. In Wire mode, clicking an existing wire starts a branch from a new junction.
-        if self.mode == "wire":
-            wid = self._find_wire_at(wx, wy)
-            if wid is not None:
-                j_ep = self._split_wire_with_junction(wid, wx, wy)
-                self._wire_start_endpoint = j_ep
-                self.update()
-                return
-
-        # 4. Select & drag component
+        # 3. Select & drag component
         comp_id = self._find_component_at(wx, wy)
         if comp_id is not None:
             comp = self.components[comp_id]
@@ -380,6 +422,16 @@ class CircuitCanvas(QWidget):
         self._mouse_world = world_pos
         self._hover_endpoint = self._find_endpoint_at(world_pos.x(), world_pos.y())
 
+        if self._pending_junction_press is not None:
+            jid, press_pos = self._pending_junction_press
+            if (event.position() - press_pos).manhattanLength() >= 5.0 and jid in self.junctions:
+                self._pending_junction_press = None
+                junc = self.junctions[jid]
+                press_world = self.screen_to_world(press_pos)
+                self._select("junction", jid)
+                self._dragging_item = ("junction", jid)
+                self._drag_offset = QPointF(press_world.x() - junc.x, press_world.y() - junc.y)
+
         if self._dragging_item is not None:
             kind, item_id = self._dragging_item
             if kind == "component" and item_id in self.components:
@@ -389,6 +441,14 @@ class CircuitCanvas(QWidget):
                 if new_x != comp.x or new_y != comp.y:
                     comp.x = new_x
                     comp.y = new_y
+                    self.circuit_modified.emit()
+            elif kind == "junction" and item_id in self.junctions:
+                junc = self.junctions[item_id]
+                new_x = _snap(world_pos.x() - self._drag_offset.x())
+                new_y = _snap(world_pos.y() - self._drag_offset.y())
+                if new_x != junc.x or new_y != junc.y:
+                    junc.x = new_x
+                    junc.y = new_y
                     self.circuit_modified.emit()
         self.update()
 
@@ -400,6 +460,12 @@ class CircuitCanvas(QWidget):
             self._panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._pending_junction_press is not None:
+                jid, _ = self._pending_junction_press
+                self._pending_junction_press = None
+                if jid in self.junctions:
+                    self._wire_start_endpoint = ("junction", jid, 0)
+                    self.update()
             self._dragging_item = None
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
@@ -437,6 +503,7 @@ class CircuitCanvas(QWidget):
 
         self._draw_grid(painter)
         self._draw_wires(painter)
+        self._draw_wire_flow(painter)
         self._draw_active_wire_preview(painter)
         self._draw_junctions(painter)
         self._draw_components(painter)
@@ -465,6 +532,36 @@ class CircuitCanvas(QWidget):
             painter.setPen(pen)
             painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
+    def _draw_wire_flow(self, painter: QPainter) -> None:
+        if not self._wire_currents:
+            return
+        dot_color = QColor(theme.FLOW_DOT)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(dot_color))
+
+        for wid, wire in self.wires.items():
+            current = self._wire_currents.get(wid, 0.0)
+            if abs(current) <= 1e-9:
+                continue
+            x1, y1 = resolve_endpoint_position(wire.start, self.components, self.junctions)
+            x2, y2 = resolve_endpoint_position(wire.end, self.components, self.junctions)
+            # Negative current flows from wire.end to wire.start.
+            if current < 0.0:
+                x1, y1, x2, y2 = x2, y2, x1, y1
+
+            dx = x2 - x1
+            dy = y2 - y1
+            length = math.hypot(dx, dy)
+            if length < 1e-3:
+                continue
+            ux = dx / length
+            uy = dy / length
+
+            d = self._wire_phases.get(wid, 0.0) % FLOW_DOT_SPACING
+            while d < length:
+                painter.drawEllipse(QPointF(x1 + ux * d, y1 + uy * d), FLOW_DOT_RADIUS, FLOW_DOT_RADIUS)
+                d += FLOW_DOT_SPACING
+
     def _draw_active_wire_preview(self, painter: QPainter) -> None:
         if self._wire_start_endpoint is None:
             return
@@ -478,11 +575,16 @@ class CircuitCanvas(QWidget):
     def _draw_junctions(self, painter: QPainter) -> None:
         for jid, junction in self.junctions.items():
             ep: EndpointKey = ("junction", jid, 0)
+            is_selected = self.selected_kind == "junction" and self.selected_id == jid
             is_hover = ep == self._hover_endpoint or ep == self._wire_start_endpoint
-            color = QColor(theme.TERMINAL_ACTIVE) if is_hover else QColor(theme.WIRE)
+            if is_hover:
+                color, radius = QColor(theme.TERMINAL_ACTIVE), 5.0
+            elif is_selected:
+                color, radius = QColor(theme.SELECTED), 5.5
+            else:
+                color, radius = QColor(theme.WIRE), 4.0
             painter.setPen(QPen(color, 1.0))
             painter.setBrush(QBrush(color))
-            radius = 5.0 if is_hover else 4.0
             painter.drawEllipse(QPointF(junction.x, junction.y), radius, radius)
 
     def _draw_node_tag(

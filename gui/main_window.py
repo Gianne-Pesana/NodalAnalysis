@@ -103,13 +103,6 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        self.btn_select_mode = QPushButton("Select / Move")
-        self.btn_select_mode.setCheckable(True)
-        self.btn_select_mode.setChecked(True)
-
-        self.btn_wire_mode = QPushButton("Wire / Junction")
-        self.btn_wire_mode.setCheckable(True)
-
         self.btn_rotate = QPushButton("Rotate (R)")
         self.btn_delete = QPushButton("Delete (Del)")
         self.btn_clear = QPushButton("Clear All")
@@ -118,15 +111,9 @@ class MainWindow(QMainWindow):
         self.btn_solve.setObjectName("PrimaryButton")
         self.btn_solve.setToolTip("Build G·V = I and solve it with Gaussian elimination")
 
-        self.btn_select_mode.setToolTip("Select, move and edit components")
-        self.btn_wire_mode.setToolTip("Click an existing wire to branch from a new junction")
-
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
-        toolbar.addWidget(self.btn_select_mode)
-        toolbar.addWidget(self.btn_wire_mode)
-        toolbar.addSeparator()
         toolbar.addWidget(self.btn_rotate)
         toolbar.addWidget(self.btn_delete)
         toolbar.addWidget(self.btn_clear)
@@ -158,11 +145,11 @@ class MainWindow(QMainWindow):
         palette_layout.addSpacing(16)
         palette_layout.addWidget(theme.label("How To", "SectionTitle", theme.caption_font()))
         help_text = (
-            "Click a terminal to start a wire, then click another terminal to finish it."
-            "<br><br>While wiring, click an existing wire to add a junction."
-            "<br><br>Scroll to zoom. Right or middle drag to pan."
+            "Click a terminal to start a wire, then click another terminal, point, or wire to connect."
+            "<br><br>Click blank canvas while wiring to place a corner or junction point."
+            "<br><br>Drag components or points to reposition. Scroll to zoom; right or middle drag to pan."
             "<br><br><b>R</b> Rotate &nbsp;&middot;&nbsp; <b>Del</b> Delete"
-            "<br><b>Esc</b> Cancel Wire"
+            "<br><b>Esc</b> / Right-click Finish Wire"
         )
         palette_layout.addWidget(theme.label(help_text, "HelpText", wrap=True))
         palette_layout.addStretch(1)
@@ -185,8 +172,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
 
     def _connect_signals(self) -> None:
-        self.btn_select_mode.clicked.connect(lambda: self._set_mode("select"))
-        self.btn_wire_mode.clicked.connect(lambda: self._set_mode("wire"))
         self.btn_rotate.clicked.connect(self.canvas.rotate_selected)
         self.btn_delete.clicked.connect(self.canvas.delete_selected)
         self.btn_clear.clicked.connect(self.canvas.clear_all)
@@ -200,11 +185,6 @@ class MainWindow(QMainWindow):
         self.canvas.circuit_modified.connect(self._on_circuit_modified)
         self.properties_panel.value_changed.connect(self._on_component_value_changed)
         self.properties_panel.flip_requested.connect(self.canvas.flip_selected_current_source)
-
-    def _set_mode(self, mode: str) -> None:
-        self.btn_select_mode.setChecked(mode == "select")
-        self.btn_wire_mode.setChecked(mode == "wire")
-        self.canvas.set_mode(mode)
 
     def _place_near_center(self, kind: str) -> None:
         center = self.canvas.screen_to_world(self.canvas.rect().center().toPointF())
