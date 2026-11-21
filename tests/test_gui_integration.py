@@ -369,6 +369,52 @@ class TestGuiIntegration(unittest.TestCase):
 
         window.close()
 
+    def test_node_numbering_left_to_right_regardless_of_bfs_order(self) -> None:
+        """Non-ground nodes are numbered N1, N2, N3 from left to right even if BFS discovers them out of order."""
+        # Place components out of left-to-right order in the input list so BFS discovers
+        # the rightmost node (around x=400) before the middle (x=200) and leftmost (x=0) nodes.
+        components = [
+            ComponentItem("R3", "resistor", 400, 100, rotation=90, value=1.0),
+            ComponentItem("R2", "resistor", 300, 0, rotation=0, value=2.0),
+            ComponentItem("R1", "resistor", 100, 0, rotation=0, value=4.0),
+            ComponentItem("I1", "current_source", 0, 100, rotation=90, value=2.0),
+            ComponentItem("GND1", "ground", 200, 200),
+        ]
+        # Left node (~x=0..55): I1.T0 (at 0, 55) -- R1.T0 (at 55, 0)
+        # Middle node (~x=145..255): R1.T1 (at 145, 0) -- R2.T0 (at 255, 0)
+        # Right node (~x=345..400): R2.T1 (at 345, 0) -- R3.T0 (at 400, 55)
+        # Ground node: I1.T1 (0, 145), R3.T1 (400, 145), GND1.T0 (200, 176)
+        wires = [
+            WireSegment("W_right", ("terminal", "R3", 0), ("terminal", "R2", 1)),
+            WireSegment("W_mid", ("terminal", "R2", 0), ("terminal", "R1", 1)),
+            WireSegment("W_left", ("terminal", "R1", 0), ("terminal", "I1", 0)),
+            WireSegment("W_gnd1", ("terminal", "I1", 1), ("terminal", "GND1", 0)),
+            WireSegment("W_gnd2", ("terminal", "R3", 1), ("terminal", "GND1", 0)),
+        ]
+        extraction = extract_circuit_from_gui(components, [], wires)
+
+        self.assertEqual(extraction.circuit.nodes, ["GND", "N1", "N2", "N3"])
+        self.assertEqual(extraction.endpoint_to_node[("terminal", "I1", 0)], "N1")
+        self.assertEqual(extraction.endpoint_to_node[("terminal", "R1", 0)], "N1")
+        self.assertEqual(extraction.endpoint_to_node[("terminal", "R1", 1)], "N2")
+        self.assertEqual(extraction.endpoint_to_node[("terminal", "R2", 0)], "N2")
+        self.assertEqual(extraction.endpoint_to_node[("terminal", "R2", 1)], "N3")
+        self.assertEqual(extraction.endpoint_to_node[("terminal", "R3", 0)], "N3")
+        self.assertEqual(extraction.endpoint_to_node[("terminal", "GND1", 0)], "GND")
+
+        self.assertEqual(extraction.wire_to_node["W_left"], "N1")
+        self.assertEqual(extraction.wire_to_node["W_mid"], "N2")
+        self.assertEqual(extraction.wire_to_node["W_right"], "N3")
+        self.assertEqual(extraction.wire_to_node["W_gnd1"], "GND")
+
+        result = solve_circuit(extraction.circuit)
+        self.assertTrue(result.verification.passed)
+        # I1=2A rotated 90 deg -> current flows from T0 (top) to T1 (bottom/GND),
+        # so -2 A enters N1 through series R1+R2+R3 = 7 ohms -> V(N1)=-14V, V(N2)=-6V, V(N3)=-2V.
+        self.assertAlmostEqual(result.node_voltages["N1"], -14.0, places=9)
+        self.assertAlmostEqual(result.node_voltages["N2"], -6.0, places=9)
+        self.assertAlmostEqual(result.node_voltages["N3"], -2.0, places=9)
+
 
 class TestNumberFormat(unittest.TestCase):
     """Display-only fraction labels for repeating decimals."""

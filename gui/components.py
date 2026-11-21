@@ -152,14 +152,29 @@ def extract_circuit_from_gui(
     for ep in groups[ground_idx]:
         endpoint_to_node[ep] = "GND"
 
+    components_by_id = {comp.component_id: comp for comp in components}
+    junctions_by_id = {junction.junction_id: junction for junction in junctions}
+
+    def _group_position_key(group: list[EndpointKey]) -> tuple[float, float]:
+        positions = [
+            resolve_endpoint_position(ep, components_by_id, junctions_by_id)
+            for ep in group
+        ]
+        count = len(positions)
+        return (
+            sum(pos[0] for pos in positions) / count,
+            sum(pos[1] for pos in positions) / count,
+        )
+
+    non_ground_groups = [
+        group
+        for idx, group in enumerate(groups)
+        if idx != ground_idx and any(ep[0] == "terminal" for ep in group)
+    ]
+    non_ground_groups.sort(key=_group_position_key)
+
     non_ground_counter = 1
-    for idx, group in enumerate(groups):
-        if idx == ground_idx:
-            continue
-        # Skip isolated junctions with no component terminals attached.
-        has_terminal = any(ep[0] == "terminal" for ep in group)
-        if not has_terminal:
-            continue
+    for group in non_ground_groups:
         node_name = f"N{non_ground_counter}"
         non_ground_counter += 1
         nodes.append(node_name)
